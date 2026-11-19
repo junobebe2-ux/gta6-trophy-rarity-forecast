@@ -13,6 +13,10 @@ Model (stdlib only, deterministic, no network):
   1. Players: least-squares line of ln(players) on ln(1 + hours since
      the release, 2026-11-19T00:00Z), over all the case's reads, read at
      the target.  Players only grow, so the slope is clamped to >= 0.
+     (A recent-24h slope was tried for the players projection and
+     rejected: on the synthetic final-like case it raised 34 of 55
+     medians, because lowering only the players slope doubles the
+     implied rate growth; the whole-history power law is kept.)
   2. Earners, per trophy: earners = rate * players / 100 in each read.
      Least-squares line of ln(earners + 0.5) on ln(1 + hours), read at
      the target.  Earners only grow, so the slope is clamped to >= 0
@@ -20,14 +24,27 @@ Model (stdlib only, deterministic, no network):
      projected players.
   3. Median rate = 100 * earners(target) / players(target), capped at
      a ceiling for the trophy: the share of players who will ever
-     hold it in the first week.  The ceiling is a prior from the
-     trophy's place in the game (intro 100%, Chapter 1 80%, Chapter 2
-     65%, Chapter 3 50%, Chapter 4 40%, final mission 30%, platinum
-     5%, 100% Completion 8%, other gold 40%, silver 35%, bronze
-     40%), and never below the last rate times 1.1.  Without it the
-     power-law earners fit extrapolates launch week's explosive
-     growth straight to ~100% for every early trophy, which no
-     trophy's ceiling allows.
+     hold it in the first week.  The ceiling is the lower of two
+     bounds.  (a) An absolute cap from the trophy's place in the
+     game, recalibrated down for realistic week-one playtime in a
+     30+ hour story (intro 100%, Chapter 1 72%, Chapter 2 58%,
+     Chapter 3 47%, Chapter 4 37%, final mission 14%, platinum 1%,
+     100% Completion 2%, other gold 25%, silver 25%, bronze 30%).
+     Most players will not finish a 30+ hour story in a week, and
+     the platinum needs essentially everything, which takes months.
+     (b) A data-driven chain bound: for each step of the story
+     chain, the ceiling is the previous chapter's ceiling times the
+     chapter-to-chapter completion ratio at the target, where the
+     ratio is fitted from the history (its trend against log-time,
+     read at the target, so a ratio still rising as players catch
+     up is allowed to rise, and a flat one stays flat).  The
+     platinum is also bounded by the 100% Completion ceiling, and
+     100% Completion by the final mission's ceiling times their
+     observed ratio.  The ceiling is never below the last rate
+     times 1.1, so a trophy already past its cap is not forced
+     down.  Without a ceiling the power-law earners fit
+     extrapolates launch week's explosive growth straight to ~100%
+     for every early trophy, which no ceiling allows.
   4. Flat history (no read differs from another, as on launch night):
      the fits are flat, so a refresh prior is applied instead.  A
      refresh is assumed in the horizon.  It adds a batch of new players
@@ -47,12 +64,16 @@ Model (stdlib only, deterministic, no network):
      non-increasing in that order; 100% Completion is <= the final
      mission.  Enforced on the medians by taking running minima.
   6. Spread, in logit units: the random-walk baseline
-     0.5 * sqrt(horizon in days), combined with a 0.35 floor for the
-     refresh jumps the history has not shown yet, and the earners
-     fit's residual scatter.  The 90-minute practice horizon gets a
-     spread several times the baseline's, because a refresh in it moves
-     every rate by ~0.3 logit; the 4.5-day final horizon is dominated
-     by the random-walk term.
+     0.5 * sqrt(horizon in days), combined with a refresh-jump term
+     and the earners fit's residual scatter.  The refresh term is
+     calibrated from the history where it has real refreshes: the
+     pooled RMS of the logit change at each read where the players
+     count moved, clamped to [0.3, 0.8].  Where the history is flat
+     (no refresh at all, as on launch night) it falls back to a 0.5
+     floor.  The 90-minute practice horizon gets a spread several
+     times the baseline's, because a refresh in it moves every rate
+     by ~0.3 logit; the 4.5-day final horizon is dominated by the
+     random-walk term.
   7. Quantiles: q_tau = inv_logit(logit(median) + z_tau * sigma),
      z = (-1.645, -0.674, 0, 0.674, 1.645), rounded to 4 decimals.
 
@@ -82,13 +103,39 @@ RELEASE = "2026-11-19T00:00:00Z"
 # counts hours apart, not continuously).
 REFRESH_HOURS = 4.0
 # Logit spread floor: the refresh jumps the history has not shown yet.
+# Used only where the history has no real refresh to calibrate from.
 SPREAD_FLOOR = 0.5
+# Bounds on the calibrated refresh volatility (pooled RMS logit change
+# at refreshes).  Below 0.3 the spread would claim more precision than
+# any refresh ever showed; above 0.8 one extreme launch refresh would
+# blow it out.
+SPREAD_CAL_MIN = 0.3
+SPREAD_CAL_MAX = 0.8
 # New players a refresh adds, on the launch-week prior (the first
 # refresh the house saw added 3,230).  A refresh is assumed about
 # every REFRESH_HOURS.
 NEW_PLAYERS_PER_REFRESH = 3000.0
 # Random-walk spread per sqrt day, as the house baseline uses it.
 SIGMA_RW = 0.5
+
+# Absolute ceiling caps (fraction 0..1) on the share of players who
+# will hold a trophy in the first week, from its place in the game.
+# Recalibrated down for realistic week-one playtime in a 30+ hour
+# story: most players will not finish it in a week, and the platinum
+# needs essentially everything, which takes months, not a week.
+ABS_CAP = {
+    "intro": 1.0,
+    "ch1": 0.72,
+    "ch2": 0.58,
+    "ch3": 0.47,
+    "ch4": 0.37,
+    "final": 0.14,
+    "platinum": 0.01,
+    "completion": 0.02,
+    "gold": 0.25,
+    "silver": 0.25,
+    "bronze": 0.30,
+}
 
 
 def parse_time(s):
@@ -146,6 +193,92 @@ def linfit(xs, ys):
     a = my - b * mx
     resid = sum((y - (a + b * x)) ** 2 for x, y in zip(xs, ys)) / n
     return a, b, resid
+
+
+def classify_trophy(trophy):
+    """Which ceiling class a trophy belongs to: intro, ch1..ch4,
+    final, platinum, completion, or its tier (gold/silver/bronze)."""
+    d = (trophy.get("description") or "").lower()
+    tier = trophy.get("tier") or ""
+    if "gone fishing" in d:
+        return "intro"
+    if "chapter 1" in d:
+        return "ch1"
+    if "chapter 2" in d:
+        return "ch2"
+    if "chapter 3" in d:
+        return "ch3"
+    if "chapter 4" in d:
+        return "ch4"
+    if "final mission" in d and tier == "gold":
+        return "final"
+    if tier == "platinum":
+        return "platinum"
+    if "100% completion" in d:
+        return "completion"
+    if tier == "gold":
+        return "gold"
+    if tier == "silver":
+        return "silver"
+    return "bronze"
+
+
+def ratio_target(reads, idx_next, idx_prev, u_target):
+    """Chapter-to-chapter completion ratio at the target, from the
+    history: rate(next) / rate(prev), fitted against ln(1 + hours)
+    and read at the target.  Only reads after the first players
+    change are used -- the flat launch-night reads have all rates
+    equal, so their ratio is meaningless.  The fitted ratio is
+    clamped to [last ratio, 0.95]: a ratio only rises as players
+    progress through the chain, and it never reaches 1 (some
+    players stop after every chapter).  Returns None when the
+    history carries no usable pair."""
+    first_p = None
+    for t, h in reads:
+        first_p = h.get("players_tracked")
+        break
+    xs, ys = [], []
+    for t, h in reads:
+        if h.get("players_tracked") == first_p:
+            continue
+        rates = h.get("rates") or []
+        a = rates[idx_prev] if idx_prev < len(rates) else None
+        b = rates[idx_next] if idx_next < len(rates) else None
+        if a is not None and b is not None and a > 0:
+            xs.append(math.log1p(t))
+            ys.append(b / a)
+    if len(ys) < 2:
+        return ys[-1] if ys else None
+    a_fit, b_fit, _ = linfit(xs, ys)
+    val = a_fit + b_fit * u_target
+    return min(0.95, max(ys[-1], val))
+
+
+def refresh_volatility(reads):
+    """Pooled RMS of the logit change at each read where the players
+    count moved, across every trophy.  That is how far a refresh
+    actually moves the rates, which is what the spread's refresh
+    term should reflect.  Returns None when the history has no
+    such read (a flat history)."""
+    total = 0.0
+    count = 0
+    prev = None
+    for t, h in reads:
+        if prev is not None and h.get("players_tracked") != prev.get("players_tracked"):
+            rates = h.get("rates") or []
+            prev_rates = prev.get("rates") or []
+            for i in range(min(len(rates), len(prev_rates))):
+                a = prev_rates[i]
+                b = rates[i]
+                if a is None or b is None:
+                    continue
+                d = logit(b) - logit(a)
+                total += d * d
+                count += 1
+        prev = h
+    if count == 0:
+        return None
+    return math.sqrt(total / count)
 
 
 def forecast_case(case, name):
@@ -213,10 +346,57 @@ def forecast_case(case, name):
         last_rates.append(r if r is not None else 0.0)
         last_players.append(pp if pp and pp > 0 else p_last)
 
-    # Ceiling per trophy (see ceiling_for): it stops the power-law
-    # earners fit from extrapolating launch week's explosive growth
-    # to ~100% for every early trophy.
-    ceilings = [ceiling_for(t, r) for t, r in zip(trophies, last_rates)]
+    # ---- ceilings ----
+    # Two bounds, the lower wins.  (a) An absolute cap from the
+    # trophy's place in the game (ABS_CAP), recalibrated down for
+    # realistic week-one playtime.  (b) A data-driven chain bound:
+    # for each step of the story chain, the previous chapter's
+    # ceiling times the chapter-to-chapter completion ratio at the
+    # target, fitted from the history.  The platinum is bounded by
+    # the 100% Completion ceiling, and 100% Completion by the final
+    # mission's ceiling times their observed ratio.  The ceiling is
+    # never below the last rate times 1.1.
+    classes = [classify_trophy(t) for t in trophies]
+    by_id = {t["id"]: idx for idx, t in enumerate(trophies)}
+    ceilings = []
+    for t, r in zip(trophies, last_rates):
+        ceilings.append(max(ABS_CAP[classify_trophy(t)], (r / 100.0) * 1.1))
+    chain = story_chain(trophies)
+    if len(chain) >= 2:
+        # Walk the chain in order; each step's ceiling is the
+        # previous chapter's ceiling times the ratio at the target.
+        prev_idx = chain[0]
+        ceilings[prev_idx] = min(ceilings[prev_idx], ABS_CAP[classes[prev_idx]])
+        for idx in chain[1:]:
+            ratio = ratio_target(reads, idx, prev_idx, u_target)
+            if ratio is not None:
+                ceilings[idx] = min(ceilings[idx], ceilings[prev_idx] * ratio)
+            ceilings[idx] = max(ceilings[idx], (last_rates[idx] / 100.0) * 1.1)
+            prev_idx = idx
+    # 100% Completion is bounded by the final mission's ceiling
+    # times their observed ratio; the platinum by the 100%
+    # Completion ceiling (it needs every trophy, 100% included).
+    if 14 in by_id and 7 in by_id:
+        ratio = ratio_target(reads, by_id[14], by_id[7], u_target)
+        if ratio is not None:
+            ceilings[by_id[14]] = min(
+                ceilings[by_id[14]], ceilings[by_id[7]] * ratio)
+        ceilings[by_id[14]] = max(
+            ceilings[by_id[14]], (last_rates[by_id[14]] / 100.0) * 1.1)
+    if 1 in by_id and 14 in by_id:
+        ceilings[by_id[1]] = min(ceilings[by_id[1]], ceilings[by_id[14]])
+        ceilings[by_id[1]] = max(
+            ceilings[by_id[1]], (last_rates[by_id[1]] / 100.0) * 1.1)
+    # Clamp every ceiling to [0, 1] (the 1.1 floor on a 100% trophy
+    # would otherwise exceed it).
+    ceilings = [min(1.0, max(0.0, c)) for c in ceilings]
+
+    # Refresh volatility for the spread: the pooled RMS logit move
+    # at real refreshes, clamped to [0.3, 0.8]; 0.5 where the
+    # history has no refresh to calibrate from.
+    vol = refresh_volatility(reads)
+    spread_floor = SPREAD_FLOOR if vol is None else min(
+        SPREAD_CAL_MAX, max(SPREAD_CAL_MIN, vol))
 
     # Earliness weight from the last rate, for the flat-history prior:
     # 1 for the highest-rate trophy, 0 for the lowest (100% excluded).
@@ -287,16 +467,19 @@ def forecast_case(case, name):
         else:
             med = 100.0 * e_hat / p_hat
         med = clamp(med)
-        # Cap at the trophy's ceiling (see ceiling_for).  This binds
-        # when the earners fit extrapolates explosive launch growth.
+        # Cap at the trophy's ceiling (see the ceilings block above).
+        # This binds when the earners fit extrapolates explosive
+        # launch growth.
         med = min(med, 100.0 * ceilings[i])
         med = clamp(med)
         medians.append(med)
 
-        # Spread: random walk + refresh-jump floor + fit residual.
+        # Spread: random walk + refresh term + fit residual.  The
+        # refresh term is the observed volatility where the history
+        # has real refreshes, else the 0.5 floor.
         sigma_rw = SIGMA_RW * math.sqrt(horizon_days)
         sigma_fit = math.sqrt(resid_e) if resid_e > 0 else 0.0
-        sigma = math.sqrt(sigma_rw ** 2 + SPREAD_FLOOR ** 2 + sigma_fit ** 2)
+        sigma = math.sqrt(sigma_rw ** 2 + spread_floor ** 2 + sigma_fit ** 2)
         sigmas.append(sigma)
 
     # If every series was flat, the fits above already used the prior
@@ -305,7 +488,6 @@ def forecast_case(case, name):
 
     # ---- monotonicity the game forces ----
     # Platinum (id 1) <= every other trophy.
-    by_id = {t["id"]: idx for idx, t in enumerate(trophies)}
     if 1 in by_id and n > 1:
         plat = by_id[1]
         others = min(medians[j] for j in range(n) if j != plat)
@@ -339,38 +521,6 @@ def forecast_case(case, name):
                 qs[j] = qs[j - 1]
         rows.append({"id": trophy["id"], "q": qs})
     return {"trophies": rows}
-
-
-def ceiling_for(trophy, last_rate):
-    """Upper bound (as a fraction 0..1) on the share of players who
-    will hold this trophy in the first week, from its place in the
-    game.  Never below the last rate times 1.1, so a trophy already
-    past its prior ceiling is not forced down by it."""
-    d = (trophy.get("description") or "").lower()
-    tier = trophy.get("tier") or ""
-    if "gone fishing" in d:
-        base = 1.0
-    elif "chapter 1" in d:
-        base = 0.80
-    elif "chapter 2" in d:
-        base = 0.65
-    elif "chapter 3" in d:
-        base = 0.50
-    elif "chapter 4" in d:
-        base = 0.40
-    elif "final mission" in d and tier == "gold":
-        base = 0.30
-    elif tier == "platinum":
-        base = 0.05
-    elif "100% completion" in d:
-        base = 0.08
-    elif tier == "gold":
-        base = 0.40
-    elif tier == "silver":
-        base = 0.35
-    else:
-        base = 0.40
-    return max(base, (last_rate / 100.0) * 1.1)
 
 
 def story_chain(trophies):
